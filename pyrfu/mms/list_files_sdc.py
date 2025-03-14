@@ -40,13 +40,15 @@ def _login_lasp():
         config = json.load(fs)
 
     # Read credentials for username
+    """
     credential = keyring.get_credential("mms-sdc", config["sdc"]["username"])
 
     if credential:
         username, password = credential.username, credential.password
     else:
         username, password = "", ""
-
+    """
+    username, password = "", ""
     if config["sdc"]["rights"] == "public":
         lasp_url = LASP_PUBL
     elif config["sdc"]["rights"] == "sitl" and username and password:

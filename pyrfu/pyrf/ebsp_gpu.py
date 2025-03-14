@@ -8,10 +8,12 @@ import warnings
 
 # 3rd party imports
 import numba
+import numba.cuda
+from numba import cuda
+import math
 import numpy as np
 import xarray as xr
 from scipy import fft
-
 from .calc_fs import calc_fs
 from .cart2sph import cart2sph
 from .convert_fac import convert_fac
@@ -21,6 +23,10 @@ from .resample import resample
 from .ts_time import ts_time
 from .ts_vec_xyz import ts_vec_xyz
 from .unix2datetime64 import unix2datetime64
+
+
+# Set the logging level for the CUDA driver to WARNING to suppress INFO logs.
+logging.getLogger("numba.cuda.cudadrv.driver").setLevel(logging.WARNING)
 
 __author__ = "Louis Richard"
 __email__ = "louisr@irfu.se"
@@ -146,34 +152,6 @@ def _freq_int(freq_int, delta_b):
     return any_range, freq_int, fs_out, out_time
 
 
-@numba.jit(cache=True, nogil=True, parallel=True, nopython=True, fastmath=True)
-def _average_data(data=None, x=None, y=None, av_window=None):
-    # average data with time x to time y using window
-    dtx, dty = [np.median(np.diff(x)), np.median(np.diff(y))]
-    if av_window is None:
-        av_window = dty
-
-    dt2 = av_window / 2
-    n_data_out = len(y)
-    # Pad data with NaNs from each side
-    n_point_to_add = int(np.ceil(dt2 / dtx))
-    pad_nan = np.ones((n_point_to_add, data.shape[1]), dtype="complex128") * np.nan
-    data_padded = np.vstack((pad_nan, data, pad_nan))
-    x_pad_pref = np.linspace(x[0] - dtx * (n_point_to_add - 1), x[0], n_point_to_add)
-    x_pad_suff = np.linspace(x[-1], x[-1] + dtx * (n_point_to_add - 1), n_point_to_add)
-    x_padded = np.hstack((x_pad_pref, x, x_pad_suff))
-    out = np.zeros((n_data_out, data.shape[1]), dtype="complex128")
-
-    il = np.digitize(y - dt2, x_padded)
-    ir = np.digitize(y + dt2, x_padded)
-
-    for i in numba.prange(len(y)):
-        for j in range(data.shape[1]):
-            out[i, j] = np.nanmean(data_padded[il[i] : ir[i], j])
-
-    return out
-
-
 def _bb_xxyyzzss(power_bx_plot, power_by_plot, power_bz_plot, power_2b_plot):
     bb_xxyyzzss = np.tile(power_bx_plot[:, :, np.newaxis], (1, 1, 4))
     bb_xxyyzzss[:, :, 1] = power_by_plot
@@ -190,20 +168,379 @@ def _ee_xxyyzzss(power_ex_plot, power_ey_plot, power_ez_plot, power_2e_plot):
     return np.real(ee_xxyyzzss)
 
 
-@numba.jit(cache=True, nogil=True, parallel=True, nopython=True, fastmath=True)
-def _censure_plot(inp, idx_nan, censure, n_data, a_):
-    out = inp.copy()
-    for i in numba.prange(len(idx_nan) - 1):
-        for j in range(len(a_)):
-            if idx_nan[i] < idx_nan[i + 1]:
-                out[int(max([i - censure[j], 0])) : i, j] = np.nan
+def get_il_ir_average(x=None, y=None, av_window=None):
 
-            if idx_nan[i] > idx_nan[i + 1]:
-                out[i : int(min([i + censure[j], n_data])), j] = np.nan
-    return out
+    dtx, dty = [np.median(np.diff(x)), np.median(np.diff(y))]
+
+    if av_window is None:
+        av_window = dty
+
+    dt2 = av_window / 2
+
+    # Pad data with NaNs from each side
+    n_point_to_add = int(np.ceil(dt2 / dtx))
+    x_pad_pref = np.linspace(x[0] - dtx * (n_point_to_add - 1), x[0], n_point_to_add)
+    x_pad_suff = np.linspace(x[-1], x[-1] + dtx * (n_point_to_add - 1), n_point_to_add)
+    x_padded = np.hstack((x_pad_pref, x, x_pad_suff))
+
+    il = np.digitize(y - dt2, x_padded)
+    ir = np.digitize(y + dt2, x_padded)
+
+    return il, ir, n_point_to_add, len(y)
+
+def _average_data_s_mat_list(data_list, x, y, av_window, censure_idx, stream_list):
+
+    n_data_out = len(y)
+    #data_padded, il, ir, n_data_out, n_cols = _average_data_helper(data, x, y, av_window)
+    dtx, dty = [np.median(np.diff(x)), np.median(np.diff(y))]
+    if av_window is None:
+        av_window = dty
+    dt2 = av_window / 2
+     # Pad data with NaNs from each side
+    n_point_to_add = int(np.ceil(dt2 / dtx))
+    x_pad_pref = np.linspace(x[0] - dtx * (n_point_to_add - 1), x[0], n_point_to_add)
+    x_pad_suff = np.linspace(x[-1], x[-1] + dtx * (n_point_to_add - 1), n_point_to_add)
+    x_padded = np.hstack((x_pad_pref, x, x_pad_suff))
+
+    il = np.digitize(y - dt2, x_padded)
+    ir = np.digitize(y + dt2, x_padded)
+
+    il_dev = numba.cuda.to_device(il)
+    ir_dev = numba.cuda.to_device(ir)
+
+    data_list_dev = []
+    n_row_list = []
+    n_col_list = []
+    out_list = []
+    result = []
+
+    for idx, data in enumerate(data_list):
+        n_row_list.append(data.shape[0])
+        n_col_list.append(data.shape[1])
+        pad_nan = np.ones((n_point_to_add, data.shape[1]), dtype="complex128") * np.nan
+        data_padded = np.vstack((pad_nan, data, pad_nan))
+        data_list_dev.append(numba.cuda.to_device(data_padded))
+        result.append(np.zeros((n_data_out, data.shape[1]), dtype="complex128"))
+
+    for idx, data in enumerate(data_list_dev):
+        # average
+        # Get the number of columns for this array.
+        n_col = n_col_list[idx]
+        
+        #out_dev = numba.cuda.to_device(out_list[idx])
+        numba.cuda.to_device(data_padded)
+        out_dev = numba.cuda.to_device( result[idx] )
+        
+
+        threadsperblock = (16, 16)
+        blockspergrid_x = math.ceil(n_data_out / threadsperblock[0])
+        blockspergrid_y = math.ceil(n_col / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+        # Launch the kernel.
+        average_data_numba_kernel[blockspergrid, threadsperblock](data_list_dev[idx], n_col, il_dev, ir_dev, out_dev)
+       
+        # Launch the kernel.
+        censure_s_mat_kernel_const[blockspergrid, threadsperblock](out_dev, censure_idx, n_data_out, n_col)
+        numba.cuda.synchronize()
+        
+        #stream_list[idx].synchronize()
+        result[idx] = out_dev.copy_to_host()
+        numba.cuda.synchronize()
+    
+    return result
 
 
-def ebsp(e_xyz, db_xyz, b_xyz, b_bgd, xyz, freq_int, **kwargs):
+def process_data_censure_average(data_list, censure_simple_dev, idx_nan_dev, censure_plot_dev, a_ , il_dev, ir_dev, n_point_to_add_time, n_data_out_time, stream_list):   
+    data_list_dev = []
+    n_row_list = []
+    n_col_list = []
+    out_list = []
+    
+    # censure simple
+    for idx, data in enumerate(data_list):
+        n_row_list.append(data.shape[0])
+        n_col_list.append(data.shape[1])
+        data_list_dev.append(numba.cuda.to_device(data))
+
+    for idx, data in enumerate(data_list_dev):
+
+        threadsperblock = (16, 16)
+        blockspergrid_x = math.ceil(n_row_list[idx] / threadsperblock[0])
+        blockspergrid_y = math.ceil(n_col_list[idx] / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        censure_simple_numba_kernel[blockspergrid, threadsperblock](data, censure_simple_dev, n_row_list[idx])
+
+        # censure plot
+        n_idx = idx_nan_dev.shape[0]
+        n_cols = len(a_) 
+        blockspergrid_x = math.ceil((n_idx - 1) / threadsperblock[0])
+        blockspergrid_y = math.ceil(n_cols / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        n_data = n_row_list[idx]
+        censure_plot_numba_kernel[blockspergrid, threadsperblock](data, idx_nan_dev, censure_plot_dev, n_data)
+
+        # average
+        # Get the number of columns for this array.
+        n_col = n_col_list[idx]
+        
+        # Allocate a device array for the padding.
+        pad_shape = (n_point_to_add_time, n_col)
+        pad_nan_dev = numba.cuda.device_array(pad_shape, dtype=np.complex128)
+        
+        # Launch kernel to fill pad_nan_dev with complex NaN.
+        blockspergrid_x = math.ceil(pad_shape[0] / threadsperblock[0])
+        blockspergrid_y = math.ceil(pad_shape[1] / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        nan_val = np.complex128(np.nan + 1j*np.nan)
+        fill_with_nan_kernel[blockspergrid, threadsperblock](pad_nan_dev, nan_val)
+        
+        n_data_in = n_row_list[idx]
+        # Allocate a new device array that will contain:
+        # [pad_nan; data; pad_nan] vertically.
+        new_shape = (n_point_to_add_time + n_data_in + n_point_to_add_time, n_col)
+        stacked_dev = cuda.device_array(new_shape, dtype=np.complex128)
+        
+        # Configure kernel for the vertical stack.
+        blockspergrid_x = math.ceil(new_shape[0] / threadsperblock[0])
+        blockspergrid_y = math.ceil(new_shape[1] / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        vstack_kernel[blockspergrid, threadsperblock](pad_nan_dev, data, stacked_dev, n_point_to_add_time)
+        
+        # Save the new vertically padded data.
+        data_list_dev[idx] = stacked_dev
+        
+        # Create an output device array of zeros with shape (n_data_out_time, n_col).
+        out_shape = (n_data_out_time, n_col)
+        # One way is to create a host zeros array and copy it.
+        out_host = np.zeros(out_shape, dtype=np.complex128)
+        out_dev = numba.cuda.to_device(out_host)
+        out_list.append(out_dev)
+
+        n_col = n_col_list[idx] 
+        threadsperblock = (16, 16)
+        blockspergrid_x = math.ceil(n_data_out_time / threadsperblock[0])
+        blockspergrid_y = math.ceil(n_col / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+        # Launch the kernel.
+        average_data_numba_kernel[blockspergrid, threadsperblock](data_list_dev[idx], n_col, il_dev, ir_dev, out_list[idx])
+        
+        #stream_list[idx].synchronize()
+        data_list[idx] = out_list[idx].copy_to_host()
+
+    return data_list
+
+
+def process_data_censure_average_poynting(data_list, censure_simple_dev, idx_nan_b_dev, idx_nan_e_dev, censure_plot_dev, n_power_b, n_power_e, 
+                                            a_ , il_dev, ir_dev, n_point_to_add_time, n_data_out_time, stream_list):   
+    data_list_dev = []
+    n_row_list = []
+    n_col_list = []
+    out_list = []
+    
+    # censure simple
+    for idx, data in enumerate(data_list):
+        n_row_list.append(data.shape[0])
+        n_col_list.append(data.shape[1])
+        data_list_dev.append(numba.cuda.to_device(data))
+
+    for idx, data in enumerate(data_list_dev):
+        threadsperblock = (16, 16)
+        blockspergrid_x = math.ceil(n_row_list[idx] / threadsperblock[0])
+        blockspergrid_y = math.ceil(n_col_list[idx] / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        censure_simple_numba_kernel[blockspergrid, threadsperblock](data, censure_simple_dev, n_row_list[idx])
+
+        # censure plot b
+        n_idx = idx_nan_b_dev.shape[0]
+        n_cols = len(a_) 
+        threadsperblock = (16, 16)
+        blockspergrid_x = math.ceil((n_idx - 1) / threadsperblock[0])
+        blockspergrid_y = math.ceil(n_cols / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        censure_plot_numba_kernel[blockspergrid, threadsperblock](data, idx_nan_b_dev, censure_plot_dev, n_power_b)
+
+        # censure plot e
+        n_idx = idx_nan_e_dev.shape[0]
+        n_cols = len(a_) 
+        threadsperblock = (16, 16)
+        blockspergrid_x = math.ceil((n_idx - 1) / threadsperblock[0])
+        blockspergrid_y = math.ceil(n_cols / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        censure_plot_numba_kernel[blockspergrid, threadsperblock](data, idx_nan_e_dev, censure_plot_dev, n_power_e)
+    
+        # average
+    
+        # Get the number of columns for this array.
+        n_col = n_col_list[idx]
+        
+        # Allocate a device array for the padding.
+        pad_shape = (n_point_to_add_time, n_col)
+        pad_nan_dev = numba.cuda.device_array(pad_shape, dtype=np.complex128)
+        
+        # Launch kernel to fill pad_nan_dev with complex NaN.
+        blockspergrid_x = math.ceil(pad_shape[0] / threadsperblock[0])
+        blockspergrid_y = math.ceil(pad_shape[1] / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        nan_val = np.complex128(np.nan + 1j*np.nan)
+        fill_with_nan_kernel[blockspergrid, threadsperblock](pad_nan_dev, nan_val)
+        
+        n_data_in = n_row_list[idx]
+        # Allocate a new device array that will contain:
+        # [pad_nan; data; pad_nan] vertically.
+        new_shape = (n_point_to_add_time + n_data_in + n_point_to_add_time, n_col)
+        stacked_dev = cuda.device_array(new_shape, dtype=np.complex128)
+        
+        # Configure kernel for the vertical stack.
+        blockspergrid_x = math.ceil(new_shape[0] / threadsperblock[0])
+        blockspergrid_y = math.ceil(new_shape[1] / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+        vstack_kernel[blockspergrid, threadsperblock](pad_nan_dev, data, stacked_dev, n_point_to_add_time)
+        
+        # Save the new vertically padded data.
+        data_list_dev[idx] = stacked_dev
+        
+        # Create an output device array of zeros with shape (n_data_out_time, n_col).
+        out_shape = (n_data_out_time, n_col)
+        # One way is to create a host zeros array and copy it.
+        out_host = np.zeros(out_shape, dtype=np.complex128)
+        out_dev = numba.cuda.to_device(out_host)
+        out_list.append(out_dev)
+
+        n_col = n_col_list[idx] 
+        threadsperblock = (16, 16)
+        blockspergrid_x = math.ceil(n_data_out_time / threadsperblock[0])
+        blockspergrid_y = math.ceil(n_col / threadsperblock[1])
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+        # Launch the kernel.
+        average_data_numba_kernel[blockspergrid, threadsperblock](data_list_dev[idx], n_col, il_dev, ir_dev, out_list[idx])
+        
+        #stream_list[idx].synchronize()
+        data_list[idx] = out_list[idx].copy_to_host()
+
+    return data_list
+
+
+
+@numba.cuda.jit(cache=True, fastmath=True, debug=False)
+def fill_with_nan_kernel(arr, nan_val):
+    i, j = cuda.grid(2)
+    if i < arr.shape[0] and j < arr.shape[1]:
+        arr[i, j] = nan_val
+
+@numba.cuda.jit(cache=True, fastmath=True, debug=False)
+def vstack_kernel(pad_dev, data_dev, out, pad_rows):
+    i, j = cuda.grid(2)
+    n_data = data_dev.shape[0]
+    if i < out.shape[0] and j < out.shape[1]:
+        if i < pad_rows:
+            # First pad region.
+            out[i, j] = pad_dev[i, j]
+        elif i < pad_rows + n_data:
+            # Data region.
+            out[i, j] = data_dev[i - pad_rows, j]
+        else:
+            # Second pad region.
+            out[i, j] = pad_dev[i - pad_rows - n_data, j]
+
+
+
+@numba.cuda.jit(cache=True, fastmath=True, debug=False)
+def censure_simple_numba_kernel(data, censure, n_row):
+    # Get the 2D thread indices: i for row, j for column.
+    i, j = cuda.grid(2)
+    
+    if i >= n_row or j >= censure.shape[0]:
+        return
+
+    # Get the censoring value for this column.
+    c = censure[j]
+    
+    # Compute lower bound: indices [0, min(c, n_row)) should be censored.
+    lower_bound = min(c,n_row)
+    # Compute upper bound: indices [max(1, n_row - c), n_row) should be censored.
+    upper_bound = max(1, n_row - c)
+
+    # If the row index i is either less than lower_bound or
+    # greater or equal to upper_bound, set the element to NaN.
+    if i < lower_bound or i >= upper_bound:
+        #nan_val = complex(float('nan'), float('nan'))
+        data[i, j] = float('nan')
+
+
+@numba.cuda.jit(cache=True, fastmath=True, debug=False)
+def censure_plot_numba_kernel(out, idx_nan, censure, n_data):
+    
+    i, j = cuda.grid(2)
+    # Determine lengths: note that we loop i from 0 to (len(idx_nan)-2)
+    n_idx = idx_nan.shape[0]
+    n_cols = censure.shape[0]  # assumed to equal len(a_)
+    if i >= n_idx - 1 or j >= n_cols:
+        return
+
+    nan_val = float('nan')
+
+    # If the next idx is greater, censor previous data
+    if idx_nan[i] < idx_nan[i + 1]:
+        start_idx = max(0,i - int(censure[j]))
+        for r in range(start_idx, i):
+                out[r, j] = nan_val
+
+    # If the next idx is smaller, censor following data
+    if idx_nan[i] > idx_nan[i + 1]:
+        end_idx = min(n_data,i + int(censure[j]))
+        for r in range(i, end_idx):
+            out[r, j] = nan_val
+
+
+@numba.cuda.jit(cache=True, fastmath=True, debug=False)
+def censure_s_mat_kernel_const(s_mat, c_const, n_data, n_col):
+
+    # Compute the 2D indices: i for row, j for column.
+    i, j = cuda.grid(2)    
+    if j >= n_col or i >= n_data:
+        return
+
+    lower_threshold = min(c_const,n_data)
+    upper_threshold = max(n_data - c_const - 1, 0)
+
+    if i < lower_threshold or i >= upper_threshold:
+        s_mat[i, j] = complex(float('nan'), float('nan'))
+
+
+
+
+@numba.cuda.jit(cache=True, fastmath=True, debug=False)
+def average_data_numba_kernel(data_padded, n_cols, il, ir, out):
+    # Compute 2D indices: i for output time, j for data column
+    i, j = cuda.grid(2)
+    n_out = out.shape[0]
+    if i >= n_out or j >= n_cols:
+        return
+
+    start = il[i]
+    end = ir[i]
+    sum_real = 0.0
+    sum_imag = 0.0
+    count = 0
+
+    # Loop over the padded data rows in the window defined by [start, end)
+    for k in range(start, end):
+        val = data_padded[k, j]
+        # Check if the value is not NaN
+        if not (math.isnan(val.real) or math.isnan(val.imag)):
+            sum_real += val.real
+            sum_imag += val.imag
+            count += 1
+    if count > 0:
+        out[i, j] = complex(sum_real / count, sum_imag / count)
+
+
+
+
+def ebsp_gpu(e_xyz, db_xyz, b_xyz, b_bgd, xyz, freq_int, **kwargs):
     """Calculates wavelet spectra of E&B and Poynting flux using wavelets
     (Morlet wavelet). Also computes polarization parameters of B using SVD
     [7]_. SVD is performed on spectral matrices computed from the time series
@@ -437,6 +774,11 @@ def ebsp(e_xyz, db_xyz, b_xyz, b_bgd, xyz, freq_int, **kwargs):
             e_xyz = e_xyz[:-1, :]
 
     in_time = db_xyz.time.data.astype(np.float64) / 1e9
+
+    il_time, ir_time, n_point_to_add_time, n_data_out_time = get_il_ir_average(in_time,out_time)
+    
+    il_time_dev = numba.cuda.to_device(il_time)
+    ir_time_dev = numba.cuda.to_device(ir_time)
 
     b_x, b_y, b_z = [None, None, None]
 
@@ -713,12 +1055,15 @@ def ebsp(e_xyz, db_xyz, b_xyz, b_bgd, xyz, freq_int, **kwargs):
             # Averaged s_mat
             s_mat_avg = np.zeros((n_data_out, 3, 3), dtype="complex128")
 
-            for comp in range(3):
-                s_mat_avg[..., comp] = _average_data(
-                    s_mat[..., comp], in_time, out_time, av_window
-                )
+            s1 = s_mat_avg[..., 0].copy()
+            s2 = s_mat_avg[..., 1].copy()
+            s3 = s_mat_avg[..., 2].copy()
 
-            # Remove data possibly influenced by edge effects
+            s1, s2, s3 = _average_data_s_mat_list([s1, s2, s3], in_time, out_time, av_window, censure[ind_a], [0,1])
+            s_mat_avg[..., 0] = s1
+            s_mat_avg[..., 1] = s2
+            s_mat_avg[..., 2] = s3
+
             censure_idx = np.hstack(
                 [
                     np.arange(np.min([censure[ind_a], len(out_time)])),
@@ -728,9 +1073,6 @@ def ebsp(e_xyz, db_xyz, b_xyz, b_bgd, xyz, freq_int, **kwargs):
                 ]
             )
             censure_idx = censure_idx.astype(np.int64)
-
-            s_mat_avg[censure_idx, ...] = np.nan
-
             # compute singular value decomposition
             # real matrix which is superposition of real part of spectral
             # matrix over imaginary part
@@ -823,84 +1165,36 @@ def ebsp(e_xyz, db_xyz, b_xyz, b_bgd, xyz, freq_int, **kwargs):
 
     # set data gaps to NaN and remove edge effects
     censure = np.floor(2 * a_)
-
-    for ind_a in range(len(a_)):
-        censure_idx = np.hstack(
-            [
-                np.arange(np.min([censure[ind_a], len(in_time)])),
-                np.arange(np.max([1, len(in_time) - censure[ind_a]]), len(in_time)),
-            ]
-        )
-
-        censure_idx = censure_idx.astype(np.int64)
-
-        power_bx_plot[censure_idx, ind_a] = np.nan
-        power_by_plot[censure_idx, ind_a] = np.nan
-        power_bz_plot[censure_idx, ind_a] = np.nan
-        power_2b_plot[censure_idx, ind_a] = np.nan
-
-        if want_ee:
-            power_ex_plot[censure_idx, ind_a] = np.nan
-            power_ey_plot[censure_idx, ind_a] = np.nan
-            power_ez_plot[censure_idx, ind_a] = np.nan
-            power_2e_plot[censure_idx, ind_a] = np.nan
-
-            power_2e_isr2_plot[censure_idx, ind_a] = np.nan
-
-            s_plot_x[censure_idx, ind_a] = np.nan
-            s_plot_y[censure_idx, ind_a] = np.nan
-            s_plot_z[censure_idx, ind_a] = np.nan
+       
+    if pc12_range or other_range:
+        censure3 = np.floor(1.8 * a_)
+    else:
+        censure3 = np.floor(0.4 * a_)
+   
 
     # remove edge effects from data gaps
     idx_nan_e = np.sum(idx_nan_e, axis=1) > 0
     idx_nan_b = np.sum(idx_nan_b, axis=1) > 0
     idx_nan_eisr2 = np.sum(idx_nan_eisr2, axis=1) > 0
 
-    n_power_b = len(power_2b_plot)
-
-    if pc12_range or other_range:
-        censure3 = np.floor(1.8 * a_)
-    else:
-        censure3 = np.floor(0.4 * a_)
-
-    # Censure magnetic fied
-    power_bx_plot = _censure_plot(power_bx_plot, idx_nan_b, censure3, n_power_b, a_)
-    power_by_plot = _censure_plot(power_by_plot, idx_nan_b, censure3, n_power_b, a_)
-    power_bz_plot = _censure_plot(power_bz_plot, idx_nan_b, censure3, n_power_b, a_)
-    power_2b_plot = _censure_plot(power_2b_plot, idx_nan_b, censure3, n_power_b, a_)
-
-    # Censure electric field
-    n_power_e = len(power_2e_plot)
-    power_ex_plot = _censure_plot(power_ex_plot, idx_nan_e, censure3, n_power_e, a_)
-    power_ey_plot = _censure_plot(power_ey_plot, idx_nan_e, censure3, n_power_e, a_)
-    power_ez_plot = _censure_plot(power_ez_plot, idx_nan_e, censure3, n_power_e, a_)
-    power_2e_plot = _censure_plot(power_2e_plot, idx_nan_e, censure3, n_power_e, a_)
-
-    power_2e_isr2_plot = _censure_plot(
-        power_2e_isr2_plot, idx_nan_e, censure3, n_power_e, a_
-    )
-
-    # Censure poynting flux
-    s_plot_x = _censure_plot(s_plot_x, idx_nan_b, censure3, n_power_b, a_)
-    s_plot_x = _censure_plot(s_plot_x, idx_nan_e, censure3, n_power_e, a_)
-    s_plot_y = _censure_plot(s_plot_y, idx_nan_b, censure3, n_power_b, a_)
-    s_plot_y = _censure_plot(s_plot_y, idx_nan_e, censure3, n_power_e, a_)
-    s_plot_z = _censure_plot(s_plot_z, idx_nan_b, censure3, n_power_b, a_)
-    s_plot_z = _censure_plot(s_plot_z, idx_nan_e, censure3, n_power_e, a_)
-
-    n_power_2e_isr2 = len(power_2e_isr2_plot)
-    power_2e_isr2_plot = _censure_plot(
-        power_2e_isr2_plot, idx_nan_eisr2, censure3, n_power_2e_isr2, a_
-    )
-
-    power_bx_plot = _average_data(power_bx_plot, in_time, out_time)
-    power_by_plot = _average_data(power_by_plot, in_time, out_time)
-    power_bz_plot = _average_data(power_bz_plot, in_time, out_time)
-    power_2b_plot = _average_data(power_2b_plot, in_time, out_time)
+ 
     
-    bb_xxyyzzss = _bb_xxyyzzss(
-        power_bx_plot, power_by_plot, power_bz_plot, power_2b_plot
-    )
+    # Prepare data for GPU with numba.cuda
+    n_power_b = len(power_2b_plot)
+    n_power_e = len(power_2e_plot)
+    idx_nan_b_dev = numba.cuda.to_device(idx_nan_b)
+    idx_nan_e_dev = numba.cuda.to_device(idx_nan_e)
+    censure3_dev = numba.cuda.to_device(censure3)
+    censure_simple_dev = numba.cuda.to_device(censure)
+    
+    
+    # Censure and average magnetic field
+
+    power_bx_plot, power_by_plot, power_bz_plot, power_2b_plot = process_data_censure_average([power_bx_plot, power_by_plot, power_bz_plot, power_2b_plot], 
+                                            censure_simple_dev, idx_nan_b_dev, censure3_dev, a_ , il_time_dev, ir_time_dev, n_point_to_add_time, n_data_out_time,  [0,1])
+    
+    
+    bb_xxyyzzss = _bb_xxyyzzss(power_bx_plot, power_by_plot, power_bz_plot, power_2b_plot)
 
     # Output
     res["t"] = unix2datetime64(out_time)
@@ -912,17 +1206,26 @@ def ebsp(e_xyz, db_xyz, b_xyz, b_bgd, xyz, freq_int, **kwargs):
     )
 
     if want_ee:
-        power_ex_plot = _average_data(power_ex_plot, in_time, out_time)
-        power_ey_plot = _average_data(power_ey_plot, in_time, out_time)
-        power_ez_plot = _average_data(power_ez_plot, in_time, out_time)
-        power_2e_plot = _average_data(power_2e_plot, in_time, out_time)
 
-        power_2e_isr2_plot = _average_data(power_2e_isr2_plot, in_time, out_time)
+        # Censure and average electric field
+
+        power_ex_plot, power_ey_plot, power_ez_plot, power_2e_plot = process_data_censure_average([power_ex_plot, power_ey_plot, power_ez_plot, power_2e_plot], 
+                                            censure_simple_dev, idx_nan_e_dev, censure3_dev, a_ , il_time_dev, ir_time_dev, n_point_to_add_time, n_data_out_time,  [0,1])
+
+        idx_nan_eisr2_dev = numba.cuda.to_device(idx_nan_eisr2)
+        power_2e_isr2_plot = process_data_censure_average([power_2e_isr2_plot], 
+                                            censure_simple_dev, idx_nan_eisr2_dev, censure3_dev, a_ , il_time_dev, ir_time_dev, n_point_to_add_time, n_data_out_time,  [0,1])[0]
         power_2e_isr2_plot = np.real(power_2e_isr2_plot)
 
-        s_plot_x = np.real(_average_data(s_plot_x, in_time, out_time))
-        s_plot_y = np.real(_average_data(s_plot_y, in_time, out_time))
-        s_plot_z = np.real(_average_data(s_plot_z, in_time, out_time))
+
+        # Censure and average poynting flux
+   
+        s_plot_x, s_plot_y, s_plot_z = process_data_censure_average_poynting([s_plot_x, s_plot_y, s_plot_z], censure_simple_dev, idx_nan_b_dev, idx_nan_e_dev, 
+                                                censure3_dev, n_power_b, n_power_e, a_ , il_time_dev, ir_time_dev, n_point_to_add_time, n_data_out_time,  [0,1])
+     
+        s_plot_x = np.real(s_plot_x)
+        s_plot_y = np.real(s_plot_y)
+        s_plot_z = np.real(s_plot_z)
 
         # TODO: check that it's correct (MATLAB weird stuff)
         s_azimuth, s_elevation, s_r = cart2sph(s_plot_x, s_plot_y, s_plot_z)

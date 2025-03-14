@@ -112,6 +112,11 @@ from .wavelet import wavelet
 from .wavepolarize_means import wavepolarize_means
 from .waverage import waverage
 
+# @Luca Pennati
+from .ebsp_gpu import ebsp_gpu
+from .wavelet_gpu import wavelet_gpu
+from .int_sph_dist_gpu import int_sph_dist_gpu
+
 __author__ = "Louis Richard"
 __email__ = "louisr@irfu.se"
 __copyright__ = "Copyright 2020-2024"
@@ -153,6 +158,7 @@ __all__ = [
     "e_vxb",
     "eb_nrf",
     "ebsp",
+    "ebsp_gpu",
     "edb",
     "end",
     "estimate",
@@ -166,6 +172,7 @@ __all__ = [
     "histogram2d",
     "increments",
     "int_sph_dist",
+    "int_sph_dist_gpu",
     "integrate",
     "iplasma_calc",
     "iso86012unix",
@@ -225,6 +232,7 @@ __all__ = [
     "vht",
     "wave_fft",
     "wavelet",
+    "wavelet_gpu",
     "wavepolarize_means",
     "waverage",
 ]

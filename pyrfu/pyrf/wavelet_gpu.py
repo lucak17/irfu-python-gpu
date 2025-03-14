@@ -9,6 +9,7 @@ from typing import Dict, Optional, Union
 # 3rd party imports
 import numba
 import numpy as np
+import cupy as cp
 import xarray as xr
 from numpy.typing import NDArray
 from scipy import fft
@@ -33,26 +34,29 @@ logging.basicConfig(
 )
 
 
-@numba.jit(nopython=True, fastmath=True)  # type: ignore
-def _ww(s_ww: NDArray[np.complex128], scales_mat: NDArray[np.float64], sigma: float, 
-        frequencies_mat: NDArray[np.float64], f_nyq: float, ) -> NDArray[np.complex128]:
-    # TODO : use nested for loop and math instead of numpy and test speed!!
-    w_w: NDArray[np.complex128] = s_ww * np.exp( -sigma * sigma * ((scales_mat * frequencies_mat - f_nyq) ** 2) / 2, )
-    w_w = w_w * np.sqrt(1.0)
+def _ww(
+    s_ww: NDArray[cp.complex128],
+    scales_mat: NDArray[cp.float64],
+    sigma: float,
+    frequencies_mat: NDArray[cp.float64],
+    f_nyq: float ) -> NDArray[cp.complex128]:
+    w_w: NDArray[cp.complex128] = s_ww * cp.exp( -sigma * sigma * ((scales_mat * frequencies_mat - f_nyq) ** 2) / 2, )
     return w_w
 
-@numba.jit(nopython=True, parallel=True, fastmath=True)  # type: ignore
-def _power_r( power: NDArray[np.complex128], new_freq_mat: NDArray[np.float64] ) -> NDArray[np.float64]:
-    power2: NDArray[np.float64] = np.absolute( (2 * np.pi) * np.conj(power) * power / new_freq_mat )
+def _power_r(
+    power: NDArray[cp.complex128], new_freq_mat: NDArray[cp.float64]
+) -> NDArray[cp.float64]:
+    power2: NDArray[cp.float64] = cp.absolute( (2 * cp.pi) * cp.conj(power) * power / new_freq_mat )
     return power2
 
-@numba.jit(nopython=True, parallel=True, fastmath=True)  # type: ignore
-def _power_c(power: NDArray[np.complex128], new_freq_mat: NDArray[np.float64] ) -> NDArray[np.complex128]:
-    power2: NDArray[np.complex128] = ( np.sqrt(np.absolute((2 * np.pi) / new_freq_mat)) * power )
+def _power_c(power, new_freq_mat):
+    power2 = ( cp.sqrt(cp.absolute((2 * cp.pi) / new_freq_mat)) * power )
     return power2
 
 
-def wavelet(
+
+
+def wavelet_gpu(
     inp: DataArray,
     f_s: Optional[float] = None,
     f: Optional[list[float]] = None,
@@ -195,34 +199,47 @@ def wavelet(
     if len(inp.shape) == 1:
         data = data[:, np.newaxis]
 
-    # go through all the data columns
+
+    # GPU arrays
+    length_data = len(data[:, 0])
+    freqs_fft_mat_dev = cp.asarray(freqs_fft_mat)
+    tile = np.tile(freqs_cwt_mat, (length_data, 1))
+    newfreqs_cwt_mat_dev = cp.asarray(tile)
+
+    scales_dev = cp.asarray(scales)
+    censure_dev = cp.floor(2 * scales_dev).astype(cp.int32)
+    rows, cols = cp.ogrid[:length_data, :scale_number]
+    mask_lower = rows < censure_dev  
+    # Mask for rows in the upper part: rows greater than or equal to (length_data - censure) for each column.
+    mask_upper = rows >= (length_data - censure_dev)
+    data_all_dev = cp.asarray(data)
     for i in range(data.shape[1]):
-        # Make the FFT of all data
-        data_col: NDArray[np.float64] = data[:, i]
-        # Wavelet transform of the data
-        # Forward FFT
-        s_w: NDArray[np.complex128] = fft.fft(data_col, workers=os.cpu_count())
-        scales_mat, s_w_mat = np.meshgrid(scales, s_w, sparse=True)
+                
+        data_dev = data_all_dev[:,i]
+        # Forward FFT on the GPU (cuFFT is used under the hood)
+        s_w_dev : NDArray[cp.complex128] = cp.fft.fft(data_dev)
+        scales_mat_dev, s_w_mat_dev = cp.meshgrid(scales_dev, s_w_dev, sparse=True)
         # Calculate the FFT of the wavelet transform
-        w_w: NDArray[np.complex128] = _ww(s_w_mat, scales_mat, sigma, freqs_fft_mat, f_nyq)
+        w_w_dev  = _ww( s_w_mat_dev, scales_mat_dev, sigma, freqs_fft_mat_dev, f_nyq )
         # Backward FFT
-        power: NDArray[np.complex128] = fft.ifft(w_w, axis=0, workers=os.cpu_count())
-        # Calculate the power spectrum
+        power_dev : NDArray[cp.complex128] = cp.fft.ifft(w_w_dev, axis=0)
+        # Calculate the power spectrum    
         if return_power:
-            power2 = _power_r(power, np.tile(freqs_cwt_mat, (len(power), 1)))
+            power2_dev = _power_r(power_dev, newfreqs_cwt_mat_dev)
         else:
-            power2 = _power_c(power, np.tile(freqs_cwt_mat, (len(power), 1)))
-
+            power2_dev = _power_c(power_dev, newfreqs_cwt_mat_dev)
         if cut_edge:
-            censure = np.floor(2 * scales).astype(int)
-            for j in range(scale_number):
-                power2[: censure[j], j] = np.nan
+            power2_dev[mask_lower] = cp.nan
+            power2_dev[mask_upper] = cp.nan
 
-                power2[len(data_col) - censure[j] : len(data_col), j] = np.nan
+        power2 = power2_dev.get()
 
         if len(inp.shape) == 2:
             # Construct xarray.DataArray here
-            out_dict[str(inp.comp.data[i])] = (["time", "frequency"], np.fliplr(power2),)
+            out_dict[str(inp.comp.data[i])] = (
+                ["time", "frequency"],
+                np.fliplr(power2),
+            )
 
     if len(inp.shape) == 1:
         out: Union[DataArray, Dataset] = xr.DataArray(

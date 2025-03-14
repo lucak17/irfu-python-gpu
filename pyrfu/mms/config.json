@@ -1,1 +1,1 @@
-{"default": "local", "local": "/Volumes/mms", "sdc": {"rights": "public", "username": "username"}, "aws": ""}
+{"default": "local", "local": "/afs/pdc.kth.se/home/p/pennati/Private/irfu/irfu-python-gpu/scripts/data", "sdc": {"rights": "public", "username": "username"}, "aws": ""}

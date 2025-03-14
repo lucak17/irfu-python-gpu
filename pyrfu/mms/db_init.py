@@ -96,6 +96,7 @@ def db_init(
 
     # Read credentials for sdc_username
     credential_path = str(keyring.util.platform_.config_root())
+    """
     credential = keyring.get_credential("mms-sdc", sdc_username)
 
     if (
@@ -111,7 +112,8 @@ def db_init(
     else:
         # if existing credentials and complete arguments overwrite
         username, password = sdc_username, sdc_password
-
+    """
+    username, password = sdc_username, sdc_password
     logging.info("Updating MMS SDC credentials in %s...", credential_path)
 
-    keyring.set_password("mms-sdc", username, password)
+    #keyring.set_password("mms-sdc", username, password)
